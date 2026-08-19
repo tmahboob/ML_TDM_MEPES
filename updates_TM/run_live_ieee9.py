@@ -1,0 +1,517 @@
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+
+
+
+
+import argparse
+from pathlib import Path
+import json
+import pandapower.networks as pn
+import pandapower as pp
+import pickle
+import numpy as np
+import warnings
+import json
+
+from src.pipeline.run_pipeline import PipelineConfig, ScenarioConfig
+from src.pipeline.streaming import run_streaming_pipeline
+from src.control.opf_controller import OPFController
+from src.control.apply_control import ensure_gen_limits
+from src.pipeline.attack_targets import choose_attack_buses_ieee9
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*encountered in matmul.*",
+    category=RuntimeWarning
+)
+
+
+def build_ieee9_network():
+    return pn.case9()
+
+
+DEFAULT_RANDOM_P_START = 0.03
+DEFAULT_RANDOM_DUR_MIN = 5
+DEFAULT_RANDOM_DUR_MAX = 40
+DEFAULT_RANDOM_COOLDOWN = 10
+DEFAULT_RANDOM_NO_ATTACK_BEFORE = 200
+
+
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="Run IEEE-9 LIVE streaming FDIA pipeline"
+    )
+
+
+    parser.add_argument(
+        "--scenario",
+        choices=[
+            "standard",
+            "random",
+            "stealth"
+        ],
+        default="stealth"
+    )
+
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42
+    )
+
+
+    parser.add_argument(
+        "--attack_schedule",
+        choices=[
+            "fixed",
+            "random"
+        ],
+        default="fixed"
+    )
+
+
+    parser.add_argument(
+        "--attack_start",
+        type=int,
+        default=50
+    )
+
+
+    parser.add_argument(
+        "--attack_end",
+        type=int,
+        default=150
+    )
+
+
+    parser.add_argument(
+        "--p_start",
+        type=float,
+        default=DEFAULT_RANDOM_P_START
+    )
+
+
+    parser.add_argument(
+        "--duration_min",
+        type=int,
+        default=DEFAULT_RANDOM_DUR_MIN
+    )
+
+
+    parser.add_argument(
+        "--duration_max",
+        type=int,
+        default=DEFAULT_RANDOM_DUR_MAX
+    )
+
+
+    parser.add_argument(
+        "--cooldown",
+        type=int,
+        default=DEFAULT_RANDOM_COOLDOWN
+    )
+
+
+    parser.add_argument(
+        "--no_attack_before",
+        type=int,
+        default=DEFAULT_RANDOM_NO_ATTACK_BEFORE
+    )
+
+
+    parser.add_argument(
+        "--representation",
+        choices=[
+            "residuals",
+            "innovations",
+            "state_derivative",
+            "state"
+        ],
+        default="state"
+    )
+
+
+    parser.add_argument(
+        "--innovation_alpha",
+        type=float,
+        default=0.7
+    )
+
+
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=5
+    )
+
+
+    # IMPORTANT
+    # Each experiment gets its own folder
+    parser.add_argument(
+        "--out_root",
+        type=str,
+        default="runs_live"
+    )
+
+
+    parser.add_argument(
+        "--stop_after_steps",
+        type=int,
+        default=None
+    )
+
+
+    parser.add_argument(
+        "--detector_type",
+        choices=[
+            "isolation_forest",
+            "ocsvm",
+            "lof"#,
+           # "none"
+        ],
+        default="ocsvm"
+    )
+
+
+    parser.add_argument(
+        "--detector_dir",
+        type=str,
+        default=(PROJECT_ROOT / "trained_detectors")
+    )
+
+
+    parser.add_argument(
+        "--log_features",
+        action="store_true"
+    )
+
+
+    parser.add_argument(
+        "--scaler_path",
+        type=str,
+        default=None
+    )
+
+
+    parser.add_argument(
+        "--enable_control",
+        action="store_true"
+    )
+
+
+    parser.add_argument(
+        "--control_on_alarm",
+        action="store_true"
+    )
+
+
+    parser.add_argument(
+        "--attack_buses",
+        type=int,
+        nargs="+",
+        default=None
+    )
+
+
+    parser.add_argument(
+        "--attack_strength",
+        type=float,
+        default=0.1
+    )
+
+
+    parser.add_argument(
+        "--enable_mitigation",
+        action="store_true"
+    )
+
+
+    parser.add_argument(
+        "--mitigation_mode",
+        type=str,
+        default="freeze",
+        choices=["freeze"]
+    )
+
+
+    parser.add_argument(
+        "--enable_recovery",
+        action="store_true"
+    )
+
+
+    parser.add_argument(
+        "--attack_envelope",
+        type=str,
+        default="raised_cosine",
+        choices=[
+            "raised_cosine",
+            "none"
+        ]
+    )
+
+
+    return parser.parse_args()
+
+
+
+def main():
+
+    args = parse_args()
+
+
+    run_dir = Path(
+        args.out_root
+    )
+
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    # Save experiment configuration
+
+    config = {
+
+        "scenario": args.scenario,
+
+        "seed": args.seed,
+
+        "detector": args.detector_type,
+
+        "window_size": args.window_size,
+
+        "representation": args.representation,
+
+        "attack_schedule": args.attack_schedule,
+
+        "stop_after_steps": args.stop_after_steps
+
+    }
+
+
+    with open(
+        run_dir / "config.json",
+        "w"
+    ) as f:
+
+        json.dump(
+            config,
+            f,
+            indent=4
+        )
+
+
+    detector = None
+    scaler = None
+    controller = None
+
+
+    net = build_ieee9_network()
+
+
+    pp.runpp(
+        net,
+        algorithm="nr",
+        init="dc",
+        calculate_voltage_angles=True
+    )
+
+
+
+    if args.enable_control:
+
+        ramp_limits = {
+            int(i): 2.0
+            for i in net.gen.index
+        }
+
+
+        ensure_gen_limits(
+            net,
+            default_headroom_mw=50.0
+        )
+
+
+        controller = OPFController(
+            ramp_limits=ramp_limits,
+            attack_bus=(
+                args.attack_buses[0]
+                if args.attack_buses
+                else None
+            ),
+            gain=5.0,
+            signal_clip=0.5
+        )
+
+
+
+    if args.detector_type != "none":
+
+        detector_path = {
+
+            "isolation_forest":
+            f"{args.detector_dir}/iforest_ieee9_W{args.window_size}_{args.representation}.pkl",
+
+            "ocsvm":
+            f"{args.detector_dir}/ocsvm_ieee9_W{args.window_size}_{args.representation}.pkl",
+
+            "lof":
+            f"{args.detector_dir}/lof_ieee9_W{args.window_size}_{args.representation}.pkl"
+
+        }[args.detector_type]
+
+
+        with open(
+            detector_path,
+            "rb"
+        ) as f:
+
+            detector = pickle.load(f)
+
+
+
+        if args.scaler_path is None:
+
+            args.scaler_path = (
+                f"{args.detector_dir}/scaler_ieee9_W{args.window_size}_{args.representation}.pkl"
+            )
+
+
+        with open(
+            args.scaler_path,
+            "rb"
+        ) as f:
+
+            scaler = pickle.load(f)
+
+
+
+    attack_buses = None
+
+
+    if args.scenario == "stealth":
+
+        if args.attack_buses:
+
+            attack_buses = args.attack_buses
+
+        else:
+
+            targets = choose_attack_buses_ieee9(net)
+
+            attack_buses = [
+                targets["central_bus"]
+            ]
+
+
+
+    config_pipeline = PipelineConfig(
+
+        network="ieee9",
+
+        seed=args.seed,
+
+        T=0
+
+    )
+
+
+    scenario = ScenarioConfig(
+
+        attack_type=args.scenario,
+
+        start=args.attack_start,
+
+        end=args.attack_end,
+
+        episodes=None,
+
+        episode_seed=None,
+
+        attack_buses=attack_buses
+
+    )
+
+
+
+    output = run_streaming_pipeline(
+
+        net,
+
+        config=config_pipeline,
+
+        scenario=scenario,
+
+        out_root=run_dir,
+
+        detector=detector,
+
+        scaler=scaler,
+
+        window_size=args.window_size,
+
+        representation=args.representation,
+
+        innovation_alpha=args.innovation_alpha,
+
+        attack_schedule_mode=args.attack_schedule,
+
+        p_start=args.p_start,
+
+        duration_min=args.duration_min,
+
+        duration_max=args.duration_max,
+
+        cooldown=args.cooldown,
+
+        no_attack_before=args.no_attack_before,
+
+        stop_after_steps=args.stop_after_steps,
+
+        log_features=args.log_features,
+
+        controller=controller,
+
+        control_on_alarm=args.control_on_alarm,
+
+        attack_strength=args.attack_strength,
+
+        attack_envelope=args.attack_envelope,
+
+        enable_mitigation=args.enable_mitigation,
+
+        mitigation_mode=args.mitigation_mode,
+
+        enable_recovery=args.enable_recovery
+
+    )
+
+
+    print(
+        f"[LIVE DONE] wrote: {output}"
+    )
+
+
+
+if __name__ == "__main__":
+
+    main()
